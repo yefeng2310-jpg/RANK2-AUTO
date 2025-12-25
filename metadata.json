@@ -1,0 +1,5 @@
+{
+  "name": "AutoRank - Decathlon Catalog Automation",
+  "description": "An automation agent to manage Rank2 Catalog updates, handling data validation, batching, and secure login workflow simulation.",
+  "requestFramePermissions": []
+}
