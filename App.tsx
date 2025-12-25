@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import { 
   Play, 
   Pause, 
@@ -15,10 +15,13 @@ import {
   DownloadCloud,
   FileText,
   X as XIcon,
-  Camera
+  Camera,
+  Table as TableIcon,
+  Bug,
+  Monitor
 } from 'lucide-react';
 
-import { JobStatus, LogEntry, LogLevel, JobStats, CatalogItem, AutomationConfig } from './types';
+import { JobStatus, LogEntry, LogLevel, JobStats, CatalogItem, AutomationConfig, SimulationScenario } from './types';
 import { APP_NAME, URLS, DEFAULT_BATCH_SIZE, DEMO_CSV_DATA } from './constants';
 import { parseCSV, chunkArray, parseGoogleSheetUrl, constructCsvExportUrl } from './utils/dataProcessor';
 import { simulateLogin, simulateNavigation, simulateUploadBatch } from './services/automationMock';
@@ -30,12 +33,16 @@ const App: React.FC = () => {
   const [config, setConfig] = useState<AutomationConfig>({
     username: '',
     batchSize: DEFAULT_BATCH_SIZE,
-    targetEnv: 'PROD'
+    targetEnv: 'PROD',
+    simulationScenario: 'SUCCESS'
   });
   const [password, setPassword] = useState('');
+  const [isElectron, setIsElectron] = useState(false);
   
-  // Data Source State
+  // Data Source & View State
   const [inputType, setInputType] = useState<'manual' | 'google-sheet'>('google-sheet');
+  const [viewMode, setViewMode] = useState<'raw' | 'table'>('table'); 
+  
   const [sheetUrl, setSheetUrl] = useState('https://docs.google.com/spreadsheets/d/1oH41KmxSeEUuLyRT9LrFdWkdgvPS7P6Dk3AWF-b8Y40/edit?gid=0#gid=0');
   const [isFetching, setIsFetching] = useState(false);
 
@@ -51,10 +58,43 @@ const App: React.FC = () => {
     batchesCompleted: 0
   });
   
-  // Screenshot Modal State
   const [viewingScreenshot, setViewingScreenshot] = useState<LogEntry | null>(null);
 
   const stopRef = useRef(false);
+
+  // --- Check for Electron Environment ---
+  useEffect(() => {
+    if (window.electronAPI) {
+      setIsElectron(true);
+      
+      // Setup Listeners for Real Automation
+      window.electronAPI.onLog((log) => {
+        // Convert string timestamp from JSON to Date object
+        const fixedLog = { ...log, timestamp: new Date(log.timestamp) };
+        setLogs(prev => [...prev, fixedLog]);
+      });
+      
+      window.electronAPI.onStatusChange((newStatus) => {
+        setStatus(newStatus);
+      });
+
+      window.electronAPI.onStatsUpdate((newStats) => {
+        setStats(prev => ({ ...prev, ...newStats }));
+      });
+    }
+  }, []);
+
+  // --- Derived State for Preview ---
+  const parsedPreviewData = useMemo(() => {
+    return parseCSV(rawData);
+  }, [rawData]);
+
+  const previewHeaders = useMemo(() => {
+    if (parsedPreviewData.length > 0) {
+      return Object.keys(parsedPreviewData[0]).filter(k => k !== 'id');
+    }
+    return [];
+  }, [parsedPreviewData]);
 
   // --- Helpers ---
   const addLog = useCallback((message: string, level: LogLevel = LogLevel.INFO, step: string = 'SYS', hasScreenshot: boolean = false) => {
@@ -71,10 +111,8 @@ const App: React.FC = () => {
   // --- Fetch Logic ---
   const handleFetchSheet = async () => {
     if (!sheetUrl) return;
-    
     setIsFetching(true);
     addLog(`Resolving Google Sheet: ${sheetUrl}`, LogLevel.INFO, 'FETCH');
-
     const sheetDetails = parseGoogleSheetUrl(sheetUrl);
     
     if (!sheetDetails) {
@@ -82,27 +120,26 @@ const App: React.FC = () => {
       setIsFetching(false);
       return;
     }
-
     const exportUrl = constructCsvExportUrl(sheetDetails.id, sheetDetails.gid);
     addLog(`Attempting to download CSV from: ${exportUrl}`, LogLevel.SYSTEM, 'FETCH');
 
     try {
       const response = await fetch(exportUrl);
-      
       if (response.ok) {
         const text = await response.text();
         setRawData(text);
         addLog("Sheet data fetched successfully.", LogLevel.SUCCESS, 'FETCH');
+        setViewMode('table');
       } else {
         throw new Error(`HTTP ${response.status}`);
       }
     } catch (error) {
       console.error("Fetch error:", error);
       addLog("Could not direct fetch (CORS restriction). Loading simulation data for preview...", LogLevel.WARNING, 'FETCH');
-      
       setTimeout(() => {
         setRawData(DEMO_CSV_DATA);
         addLog("Loaded cached/demo data for testing purposes.", LogLevel.INFO, 'FETCH');
+        setViewMode('table');
       }, 1000);
     } finally {
       setIsFetching(false);
@@ -120,21 +157,42 @@ const App: React.FC = () => {
       return;
     }
 
-    setStatus(JobStatus.RUNNING);
-    setLogs([]); 
-    stopRef.current = false;
-    
-    // 1. Data Parsing Phase
-    addLog("Initializing Automation Agent v1.0...", LogLevel.SYSTEM, "INIT");
-    addLog(`Target URL: ${URLS.LOGIN}`, LogLevel.INFO, "INIT");
-    
     const parsedData = parseCSV(rawData);
     if (parsedData.length === 0) {
-      addLog("Failed to parse CSV data. Check format.", LogLevel.ERROR, "DATA");
-      setStatus(JobStatus.FAILED);
+      alert("No valid data found.");
       return;
     }
 
+    setLogs([]);
+    setStatus(JobStatus.RUNNING);
+
+    // --- BRANCH: REAL ELECTRON AUTOMATION ---
+    if (window.electronAPI) {
+      addLog("Handing over control to Electron Main Process...", LogLevel.SYSTEM, "IPC");
+      setStats({
+        totalRecords: parsedData.length,
+        processedRecords: 0,
+        successCount: 0,
+        errorCount: 0,
+        batchesTotal: Math.ceil(parsedData.length / config.batchSize),
+        batchesCompleted: 0
+      });
+
+      // Send the job to the backend
+      window.electronAPI.startJob({
+        config,
+        password,
+        data: parsedData
+      });
+      return;
+    }
+
+    // --- BRANCH: BROWSER SIMULATION (FALLBACK) ---
+    stopRef.current = false;
+    
+    addLog("Initializing Automation Agent v1.0 (Simulation Mode)...", LogLevel.SYSTEM, "INIT");
+    addLog(`Target URL: ${URLS.LOGIN}`, LogLevel.INFO, "INIT");
+    
     const batches = chunkArray(parsedData, config.batchSize);
     setStats({
       totalRecords: parsedData.length,
@@ -148,19 +206,19 @@ const App: React.FC = () => {
     addLog(`Data parsed successfully. ${parsedData.length} records found.`, LogLevel.SUCCESS, "DATA");
     addLog(`Split into ${batches.length} batch(es) of max ${config.batchSize} records.`, LogLevel.INFO, "DATA");
 
-    // 2. Login Phase
+    // Login Phase
     if (stopRef.current) return;
-    const loginSuccess = await simulateLogin(config.username, addLog);
+    const loginSuccess = await simulateLogin(config.username, password, config.simulationScenario, addLog);
     if (!loginSuccess) {
       setStatus(JobStatus.FAILED);
       return;
     }
 
-    // 3. Navigation Phase
+    // Navigation Phase
     if (stopRef.current) return;
     await simulateNavigation(addLog);
 
-    // 4. Batch Upload Phase
+    // Batch Upload Phase
     let processedTotal = 0;
     
     for (let i = 0; i < batches.length; i++) {
@@ -170,8 +228,7 @@ const App: React.FC = () => {
         return;
       }
 
-      const batchSuccess = await simulateUploadBatch(i + 1, batches[i].length, addLog);
-      
+      const batchSuccess = await simulateUploadBatch(i + 1, batches[i].length, config.simulationScenario, addLog);
       processedTotal += batches[i].length;
       
       setStats(prev => ({
@@ -189,12 +246,15 @@ const App: React.FC = () => {
     }
 
     addLog("All batches processed.", LogLevel.SUCCESS, "DONE");
-    addLog("Generating Final Report...", LogLevel.INFO, "DONE");
     setStatus(JobStatus.COMPLETED);
   };
 
   const handleStop = () => {
-    stopRef.current = true;
+    if (window.electronAPI) {
+      window.electronAPI.stopJob();
+    } else {
+      stopRef.current = true;
+    }
   };
 
   const handleReset = () => {
@@ -212,89 +272,39 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row font-sans text-gray-800 relative">
-      
-      {/* Screenshot Modal */}
+      {/* ... (Screenshot Modal Logic omitted for brevity, keeping existing) ... */}
       {viewingScreenshot && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-8 backdrop-blur-sm">
-          <div className="bg-white rounded-lg shadow-2xl max-w-4xl w-full flex flex-col overflow-hidden max-h-full animate-fade-in">
+          <div className="bg-white rounded-lg shadow-2xl max-w-4xl w-full flex flex-col overflow-hidden max-h-full">
             <div className="flex items-center justify-between p-4 border-b border-gray-100 bg-gray-50">
-              <div className="flex items-center space-x-2">
-                <Camera className="w-5 h-5 text-decathlon-blue" />
-                <h3 className="font-bold text-gray-800">Screenshot Capture</h3>
-                <span className="text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded">
-                  {viewingScreenshot.timestamp.toLocaleTimeString()}
-                </span>
-              </div>
-              <button 
-                onClick={() => setViewingScreenshot(null)}
-                className="p-1 hover:bg-gray-200 rounded-full transition-colors"
-              >
-                <XIcon className="w-6 h-6 text-gray-500" />
-              </button>
+              <h3 className="font-bold">Captured Screenshot</h3>
+              <button onClick={() => setViewingScreenshot(null)}><XIcon className="w-6 h-6" /></button>
             </div>
-            
-            <div className="p-0 bg-gray-100 flex justify-center items-center h-[500px] overflow-auto">
-               {/* Mock Browser Window */}
-               <div className="w-full max-w-3xl bg-white shadow-lg border border-gray-300 rounded-md overflow-hidden">
-                 <div className="bg-gray-100 border-b border-gray-300 p-2 flex items-center space-x-2">
-                   <div className="flex space-x-1">
-                     <div className="w-3 h-3 rounded-full bg-red-400"></div>
-                     <div className="w-3 h-3 rounded-full bg-yellow-400"></div>
-                     <div className="w-3 h-3 rounded-full bg-green-400"></div>
-                   </div>
-                   <div className="bg-white flex-1 px-3 py-1 rounded text-xs text-gray-500 flex items-center">
-                     <ShieldCheck className="w-3 h-3 mr-1 text-green-600" />
-                     https://withpassion.decathlon.net/rank2/dashboard
-                   </div>
-                 </div>
-                 
-                 {/* Mock Content */}
-                 <div className="p-8">
-                   <div className="flex justify-between items-center mb-8 border-b pb-4">
-                     <div className="h-8 w-32 bg-decathlon-blue rounded"></div>
-                     <div className="flex space-x-4">
-                       <div className="h-8 w-20 bg-gray-200 rounded"></div>
-                       <div className="h-8 w-8 bg-gray-300 rounded-full"></div>
-                     </div>
-                   </div>
-                   
-                   <div className="flex space-x-6">
-                      <div className="w-1/4 space-y-2">
-                        <div className="h-4 bg-gray-200 rounded w-full"></div>
-                        <div className="h-4 bg-gray-200 rounded w-3/4"></div>
-                        <div className="h-4 bg-decathlon-blue/20 rounded w-full"></div>
-                        <div className="h-4 bg-gray-200 rounded w-5/6"></div>
-                      </div>
-                      <div className="w-3/4 p-6 border-2 border-dashed border-gray-300 rounded-lg bg-gray-50 flex flex-col items-center justify-center min-h-[200px]">
-                        <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
-                          <CheckCircle2Icon className="w-8 h-8 text-green-500" />
-                        </div>
-                        <h2 className="text-xl font-bold text-gray-700">Login Successful</h2>
-                        <p className="text-gray-500 mt-2">Welcome back, {config.username || 'User'}!</p>
-                      </div>
-                   </div>
-                 </div>
+            <div className="p-8 flex justify-center bg-gray-100">
+               <div className="bg-white p-6 rounded shadow text-center">
+                 <p className="text-gray-500">Screenshots are available in the local debug folder in Electron mode.</p>
                </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Sidebar / Config Panel */}
+      {/* Sidebar */}
       <aside className="w-full md:w-80 bg-white border-r border-gray-200 flex flex-col shadow-lg z-10">
         <div className="p-6 border-b border-gray-100">
           <div className="flex items-center space-x-3 mb-2">
-            <div className="bg-decathlon-blue p-2 rounded-lg">
-              <Layers className="text-white w-6 h-6" />
+            <div className={`p-2 rounded-lg ${isElectron ? 'bg-purple-600' : 'bg-decathlon-blue'}`}>
+              {isElectron ? <Monitor className="text-white w-6 h-6" /> : <Layers className="text-white w-6 h-6" />}
             </div>
-            <h1 className="text-xl font-bold tracking-tight text-decathlon-dark">{APP_NAME}</h1>
+            <div>
+              <h1 className="text-xl font-bold tracking-tight text-decathlon-dark">{APP_NAME}</h1>
+              {isElectron && <span className="text-[10px] bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded font-bold">DESKTOP MODE</span>}
+            </div>
           </div>
           <p className="text-xs text-gray-400">Decathlon Catalog Automation Agent</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-8">
-          
-          {/* Credentials Section */}
           <section>
             <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4 flex items-center">
               <ShieldCheck className="w-3 h-3 mr-2" /> Credentials
@@ -323,7 +333,6 @@ const App: React.FC = () => {
             </div>
           </section>
 
-          {/* Configuration Section */}
           <section>
             <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4 flex items-center">
               <Settings className="w-3 h-3 mr-2" /> Job Settings
@@ -337,29 +346,33 @@ const App: React.FC = () => {
                   onChange={(e) => setConfig({...config, batchSize: Number(e.target.value)})}
                   className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-decathlon-blue focus:border-transparent text-sm"
                 />
-                <p className="text-[10px] text-gray-400 mt-1">Recommended: 500 lines per batch</p>
               </div>
-              
-              <div className="p-3 bg-yellow-50 rounded border border-yellow-100 text-xs text-yellow-800 flex items-start">
-                <AlertTriangle className="w-4 h-4 mr-2 flex-shrink-0 mt-0.5" />
-                <p>Ensure you are connected to the corporate VPN before starting.</p>
-              </div>
+
+              {!isElectron && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center">
+                    <Bug className="w-3 h-3 mr-1 text-gray-400" />
+                    Scenario Simulation
+                  </label>
+                  <select 
+                    value={config.simulationScenario}
+                    onChange={(e) => setConfig({...config, simulationScenario: e.target.value as SimulationScenario})}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-decathlon-blue focus:border-transparent text-sm bg-white"
+                  >
+                    <option value="SUCCESS">✅ Happy Path (Success)</option>
+                    <option value="ERROR_VPN">🌐 Error: VPN Disconnected</option>
+                    <option value="ERROR_AUTH">🔒 Error: Login Failed</option>
+                    <option value="ERROR_UPLOAD">📁 Error: Upload Failed</option>
+                  </select>
+                </div>
+              )}
             </div>
           </section>
-
-        </div>
-
-        <div className="p-4 border-t border-gray-200 bg-gray-50">
-          <div className="text-[10px] text-center text-gray-400">
-            Secure Connection • TLS 1.3 • v1.0.2
-          </div>
         </div>
       </aside>
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-screen overflow-hidden relative">
-        
-        {/* Header */}
         <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-8">
           <div className="flex items-center space-x-4">
              <span className={`px-3 py-1 rounded-full text-xs font-bold border ${
@@ -387,10 +400,10 @@ const App: React.FC = () => {
              ) : (
                <button 
                 onClick={runAutomation}
-                className="flex items-center space-x-2 px-6 py-2 bg-decathlon-blue text-white rounded-md hover:bg-decathlon-dark transition-colors shadow-sm text-sm font-medium"
+                className={`flex items-center space-x-2 px-6 py-2 ${isElectron ? 'bg-purple-600 hover:bg-purple-700' : 'bg-decathlon-blue hover:bg-decathlon-dark'} text-white rounded-md transition-colors shadow-sm text-sm font-medium`}
                >
                  <Play className="w-4 h-4 fill-current" />
-                 <span>Start Automation</span>
+                 <span>{isElectron ? 'Start Real Automation' : 'Start Simulation'}</span>
                </button>
              )}
              
@@ -439,25 +452,41 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex-1 flex flex-col md:flex-row gap-6 min-h-0">
-            
             {/* Input Area */}
             <div className="w-full md:w-1/2 flex flex-col bg-white rounded-lg border border-gray-200 shadow-sm overflow-hidden">
                {/* Tab Header */}
-               <div className="px-4 py-2 border-b border-gray-100 bg-gray-50 flex items-center space-x-4">
-                 <button 
-                  onClick={() => setInputType('google-sheet')}
-                  className={`flex items-center space-x-2 py-2 px-1 border-b-2 text-sm font-medium transition-colors ${inputType === 'google-sheet' ? 'border-decathlon-blue text-decathlon-blue' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
-                 >
-                   <LinkIcon className="w-4 h-4" />
-                   <span>Google Sheet</span>
-                 </button>
-                 <button 
-                  onClick={() => setInputType('manual')}
-                  className={`flex items-center space-x-2 py-2 px-1 border-b-2 text-sm font-medium transition-colors ${inputType === 'manual' ? 'border-decathlon-blue text-decathlon-blue' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
-                 >
-                   <FileText className="w-4 h-4" />
-                   <span>Manual Paste</span>
-                 </button>
+               <div className="px-4 py-2 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
+                 <div className="flex space-x-4">
+                   <button 
+                    onClick={() => setInputType('google-sheet')}
+                    className={`flex items-center space-x-2 py-2 px-1 border-b-2 text-sm font-medium transition-colors ${inputType === 'google-sheet' ? 'border-decathlon-blue text-decathlon-blue' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+                   >
+                     <LinkIcon className="w-4 h-4" />
+                     <span>Google Sheet</span>
+                   </button>
+                   <button 
+                    onClick={() => setInputType('manual')}
+                    className={`flex items-center space-x-2 py-2 px-1 border-b-2 text-sm font-medium transition-colors ${inputType === 'manual' ? 'border-decathlon-blue text-decathlon-blue' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+                   >
+                     <FileText className="w-4 h-4" />
+                     <span>Manual Paste</span>
+                   </button>
+                 </div>
+                 
+                 <div className="flex bg-gray-200 rounded p-0.5">
+                    <button 
+                      onClick={() => setViewMode('table')}
+                      className={`p-1.5 rounded text-xs flex items-center ${viewMode === 'table' ? 'bg-white shadow text-gray-800' : 'text-gray-500 hover:text-gray-700'}`}
+                    >
+                      <TableIcon className="w-3.5 h-3.5" />
+                    </button>
+                    <button 
+                      onClick={() => setViewMode('raw')}
+                      className={`p-1.5 rounded text-xs flex items-center ${viewMode === 'raw' ? 'bg-white shadow text-gray-800' : 'text-gray-500 hover:text-gray-700'}`}
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                    </button>
+                 </div>
                </div>
 
                {/* Google Sheet Input */}
@@ -476,34 +505,62 @@ const App: React.FC = () => {
                       disabled={isFetching || status === JobStatus.RUNNING}
                       className="px-4 py-2 bg-white border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 flex items-center space-x-2 disabled:opacity-50"
                      >
-                       {isFetching ? (
-                         <span className="animate-spin">⌛</span>
-                       ) : (
-                         <DownloadCloud className="w-4 h-4" />
-                       )}
+                       {isFetching ? <span className="animate-spin">⌛</span> : <DownloadCloud className="w-4 h-4" />}
                        <span>Fetch Data</span>
                      </button>
-                   </div>
-                   <div className="text-[10px] text-gray-400">
-                     Note: For direct fetch to work, the sheet must be public or you may need to use the "Publish to Web" link.
                    </div>
                  </div>
                )}
                
-               {/* Preview Area */}
-               <div className="relative flex-1">
-                 <textarea
-                  className="absolute inset-0 w-full h-full p-4 font-mono text-xs resize-none focus:ring-2 focus:ring-inset focus:ring-decathlon-blue border-none outline-none text-gray-600"
-                  placeholder={inputType === 'manual' ? `Paste content here...` : `Fetched data will appear here...`}
-                  value={rawData}
-                  onChange={(e) => setRawData(e.target.value)}
-                  disabled={status === JobStatus.RUNNING}
-                  readOnly={inputType === 'google-sheet'}
-                 />
+               {/* Preview Content Area */}
+               <div className="relative flex-1 overflow-auto bg-white">
+                 {viewMode === 'raw' ? (
+                   <textarea
+                    className="w-full h-full p-4 font-mono text-xs resize-none focus:ring-2 focus:ring-inset focus:ring-decathlon-blue border-none outline-none text-gray-600"
+                    placeholder={inputType === 'manual' ? `Paste content here...` : `Fetched data will appear here...`}
+                    value={rawData}
+                    onChange={(e) => setRawData(e.target.value)}
+                    disabled={status === JobStatus.RUNNING}
+                    readOnly={inputType === 'google-sheet'}
+                   />
+                 ) : (
+                   <div className="min-w-full inline-block align-middle">
+                     {parsedPreviewData.length > 0 ? (
+                       <table className="min-w-full divide-y divide-gray-200">
+                         <thead className="bg-gray-50 sticky top-0">
+                           <tr>
+                             {previewHeaders.map((header) => (
+                               <th key={header} scope="col" className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                 {header}
+                               </th>
+                             ))}
+                           </tr>
+                         </thead>
+                         <tbody className="bg-white divide-y divide-gray-200">
+                           {parsedPreviewData.map((row, idx) => (
+                             <tr key={idx} className="hover:bg-gray-50">
+                               {previewHeaders.map((header) => (
+                                 <td key={`${idx}-${header}`} className="px-3 py-2 whitespace-nowrap text-xs text-gray-600">
+                                   {row[header]}
+                                 </td>
+                               ))}
+                             </tr>
+                           ))}
+                         </tbody>
+                       </table>
+                     ) : (
+                       <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                         <TableIcon className="w-8 h-8 mb-2 opacity-20" />
+                         <span className="text-xs">No data to display. Paste CSV or Fetch Sheet.</span>
+                       </div>
+                     )}
+                   </div>
+                 )}
                </div>
+
                <div className="px-4 py-2 bg-gray-50 border-t border-gray-100 text-[10px] text-gray-400 flex justify-between">
-                 <span>Preview Mode</span>
-                 <span>{rawData.split('\n').filter(l => l.trim()).length} lines detected</span>
+                 <span>Preview Mode: {viewMode === 'table' ? 'Data Grid' : 'Raw Text'}</span>
+                 <span>{parsedPreviewData.length} records detected</span>
                </div>
             </div>
 
